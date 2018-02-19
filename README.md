@@ -1,5 +1,5 @@
 # sparkdeploy
-＃＃ spark 部署模式之自定义＋一键提交
+## spark 部署模式之自定义＋一键提交
 如：
  object MonitorEventStreamingRunner extends App {
      val workerNum = "4"
