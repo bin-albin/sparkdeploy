@@ -1,0 +1,27 @@
+package cn.ce.bigdata.spark
+
+import org.apache.spark.AccumulableParam
+import scala.collection.mutable.Map
+
+/**
+  * @author liubin
+  */
+object SparkAppCounterAccumulableParam
+    extends AccumulableParam[Map[String, Long], (String, Long)] {
+
+  override def addAccumulator(r: Map[String, Long], t: (String, Long)): Map[String, Long] = {
+    r.put(t._1, r.getOrElse(t._1, 0L) + t._2)
+    r
+  }
+
+  override def addInPlace(r1: Map[String, Long], r2: Map[String, Long]): Map[String, Long] = {
+    val r = Map.empty[String, Long] ++ r1
+    r2.foreach { case (key, value) => r.put(key, value + r.getOrElse(key, 0L)) }
+    r
+  }
+
+  override def zero(initialValue: Map[String, Long]): Map[String, Long] = {
+    Map.empty[String, Long] ++ initialValue
+  }
+}
+
