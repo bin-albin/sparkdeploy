@@ -1,0 +1,229 @@
+package cn.ce.bigdata.spark
+
+import java.io.File
+import java.net.{ URL, URLClassLoader }
+import java.util.regex.Pattern
+
+import scala.collection.JavaConversions.mapAsJavaMap
+import scala.reflect.NameTransformer.{ MODULE_SUFFIX_STRING, NAME_JOIN_STRING }
+
+import org.apache.hadoop.conf.Configuration
+import org.apache.hadoop.fs.{ FileSystem, Path }
+import org.apache.spark.SparkContext
+import org.apache.spark.deploy.SparkSubmit
+
+import cn.ce.bigdata.util.ClassUtils
+
+abstract sealed class SparkAppOption(val optionName: String) {
+  override def toString = optionName
+  def toNameString =
+    ((getClass.getName stripSuffix MODULE_SUFFIX_STRING split '.').last split
+      Pattern.quote(NAME_JOIN_STRING)).last
+  def compareTo(that: SparkAppOption) = this.optionName.compareTo(that.optionName)
+
+  def ordinal = SparkAppOption.values.indexOf(SparkAppOption.valueOf(toNameString))
+}
+
+object SparkAppOption {
+  val values = Array[SparkAppOption](Name, Clazz, Master, Jars, DriverCores, DirverMemory, DirverJavaOptions,
+    NumExecutors, ExecutorMemory, ExecutorCores, Files, Archives, PropertiesFile, Verbose)
+
+  def valueOf(name: String) = values.find { x => x.toString() == name }
+}
+case object Name extends SparkAppOption("--name")
+case object Clazz extends SparkAppOption("--class")
+case object Master extends SparkAppOption("--master")
+case object Jars extends SparkAppOption("--jars")
+case object DriverCores extends SparkAppOption("--driver-cores")
+case object DirverMemory extends SparkAppOption("--driver-memory")
+case object DirverJavaOptions extends SparkAppOption("--driver-java-options")
+case object NumExecutors extends SparkAppOption("--num-executors")
+case object ExecutorMemory extends SparkAppOption("--executor-memory")
+case object ExecutorCores extends SparkAppOption("--executor-cores")
+case object Files extends SparkAppOption("--files")
+case object Archives extends SparkAppOption("--archives")
+case object Queue extends SparkAppOption("--queue")
+case object PropertiesFile extends SparkAppOption("--properties-file")
+case object Verbose extends SparkAppOption("-v")
+
+abstract sealed class DependencyGroup(val hdfsPath: String) {
+  override def toString = s"${toNameString} ---> ${hdfsPath}"
+  def toNameString =
+    ((getClass.getName stripSuffix MODULE_SUFFIX_STRING split '.').last split
+      Pattern.quote(NAME_JOIN_STRING)).last
+  def compareTo(that: DependencyGroup) = this == that
+
+  def ordinal = DependencyGroup.values.indexOf(DependencyGroup.valueOf(toNameString))
+}
+
+object DependencyGroup {
+  val values = Array[DependencyGroup](HBase)
+  def valueOf(name: String) = values.find { x => x.toString() == name }
+}
+case object HBase extends DependencyGroup("/data/apps/hbase-1.0.1.1")
+case object Hive121 extends DependencyGroup("/data/apps/hive-1.2.1")
+case object StreamingKafka extends DependencyGroup("/data/apps/spark-streaming-kafka-2.0.0")
+case object Jedis251 extends DependencyGroup("/data/apps/jedis-2.5.1.jar")
+case object ZKClient extends DependencyGroup("/data/apps/zkclient-0.3.jar")
+case object ConfigFile extends DependencyGroup("/data/apps/config.xml")
+
+object SparkApp {
+  private val DEFAULT_HADOOP_CONFIG_DIR = "/etc/hadoop/conf" ///etc/hadoop/conf
+  def apply(classname: String): SparkApp = {
+    apply(classname, DEFAULT_HADOOP_CONFIG_DIR)
+  }
+
+  def apply(classname: String, hconfDir: String): SparkApp = {
+    val app = new SparkApp();
+    app.setClassname(classname)
+    app.setHadoopConfDir(hconfDir) 
+    app
+  }
+
+  def getAccumulable(sc: SparkContext) = sc.accumulable[scala.collection.mutable.Map[String, Long], (String, Long)](scala.collection.mutable.Map.empty[String, Long])(SparkAppCounterAccumulableParam)
+}
+class SparkApp {
+
+  private var classname: String = null
+  private var hadoopConfDir: String = null
+
+  private var targetJar = ""
+  private var classpath = Set.empty[String]
+  private var javaEnv = Map.empty[String, String]
+  private var options = scala.collection.mutable.Map.empty[SparkAppOption, String]
+  private var sparkProps = scala.collection.mutable.Map(("spark.yarn.jar", "hdfs:/data/apps/spark-1.6.0/spark-assembly-2.0.0-hadoop2.7.1.jar"),
+    ("spark.executor.extraJavaOptions",       Set("-XX:+UseParNewGC", "-XX:+UseConcMarkSweepGC", "-XX:CMSInitiatingOccupancyFraction=70",
+        "-XX:+UseCMSCompactAtFullCollection", "-XX:CMSFullGCsBeforeCompaction=3" //, "-XX:+PrintGCDetails", "-XX:+PrintGCDateStamps", "-XX:+PrintHeapAtGC" 
+        //uncomment above options to trace gc detail only when tuning GC
+        //MUST NOT use them in product env
+        ).mkString(" ")))
+  private var classParams = Seq.empty[String]
+  private var dependencyGroups = Set.empty[DependencyGroup]
+  private var dependencyJars = Set.empty[String]
+
+  private def SparkApp() {
+  }
+
+  def setClassname(clazz: String): SparkApp = {
+    classname = clazz
+    this
+  }
+
+  def setHadoopConfDir(confDir: String): SparkApp = {
+    hadoopConfDir = confDir
+    this
+  }
+  def setTargetJar(jar: String): SparkApp = {
+    targetJar = jar
+    this
+  }
+
+  def addClasspath(jarPath: String): SparkApp = {
+    classpath = classpath + jarPath
+    this
+  }
+
+  def addClassParams(param: String): SparkApp = {
+    classParams = classParams :+ param
+    this
+  }
+
+  def addJavaEnv(key: String, value: String): SparkApp = {
+    javaEnv = javaEnv + ((key, value))
+    this
+  }
+
+  def addOptions(key: SparkAppOption, value: String): SparkApp = {
+    options.put(key, value)
+    this
+  }
+
+  def addSparkProps(key: String, value: String): SparkApp = {
+    sparkProps.put(key, value)
+    this
+  }
+
+  def addDependencyGroup(group: DependencyGroup): SparkApp = {
+    dependencyGroups = dependencyGroups + group
+    this
+  }
+
+  def addDependencyJars(jar: String): SparkApp = {
+    dependencyJars = dependencyJars + jar
+    this
+  }
+
+  def run(): Unit = {
+    if (classname == null || hadoopConfDir == null) {
+      throw new IllegalStateException(s"The properties of 'classname' and 'hadoopConfDir' must not be null")
+    }
+
+    //load resources to classpath
+    classpath = classpath + hadoopConfDir
+    classpath.foreach { loadResources }
+
+    Configuration.addDefaultResource("core-site.xml")
+    Configuration.addDefaultResource("hdfs-site.xml")
+    //    Configuration.addDefaultResource("yarn-site.xml")
+    Configuration.addDefaultResource("mapred-site.xml")
+    val conf = new Configuration
+    conf.setQuietMode(false)
+
+    if (!dependencyGroups.isEmpty) {
+      val fs = FileSystem.get(conf)
+      val dependencies = dependencyGroups.flatMap { group => fs.listStatus(new Path(group.hdfsPath)) }
+        .map { fStatus => fStatus.getPath.toString() }
+        .mkString(",")
+      options(Jars) = s"${if (options.contains(Jars)) options(Jars) + "," else ""}${dependencies}"
+    }
+    if (!dependencyJars.isEmpty) {
+      options(Jars) = s"${if (options.contains(Jars)) options(Jars) + "," else ""}${dependencyJars.mkString(",")}"
+    }
+
+    if (!options.contains(Name)) options.put(Name, classname.substring(classname.lastIndexOf('.') + 1))
+
+    // add cli args
+    var args = Seq.empty[String]
+    options.foreach {
+      case (optionType, value) =>
+        args = args :+ optionType.optionName
+        optionType match {
+          case Verbose =>
+          case _       => args = args :+ value
+        }
+
+    }
+
+    //add spark system properties
+    val props = System.getProperties
+    sparkProps.foreach { case (key, value) => props.setProperty(key, value) }
+    println(props)
+
+    //add envrioment variables
+    javaEnv = javaEnv + (("HADOOP_CONF_DIR", hadoopConfDir))
+    ClassUtils.setEnv(javaEnv)
+    println(sys.env)
+
+    var pathToJar = if (targetJar == "") ClassUtils.findJar(this.getClass, "SparkApp.jar") else targetJar
+    args = args :+ Clazz.optionName :+ classname
+    args = args :+ pathToJar
+    args = args ++: classParams
+    println(args.mkString(" "))
+    SparkSubmit.main(args.toArray)
+
+  }
+
+  private val addURL = initAddMethod()
+  private val loader = ClassLoader.getSystemClassLoader.asInstanceOf[URLClassLoader]
+
+  private def initAddMethod() = {
+    val add = classOf[URLClassLoader].getDeclaredMethod("addURL", Array(classOf[URL]): _*)
+    add.setAccessible(true)
+    add
+  }
+
+  def loadResources(absoluteDirPath: String) {
+    val dir = new File(absoluteDirPath)
+    addURL.invoke(loader, Array(dir.toURI().toURL()): _*)
+  }
+}
