@@ -1,0 +1,170 @@
+/**
+  * Monitor Index REAL-Time-System
+  * ----------------------------------------------
+  * 0 . Cache DB Direct Data
+  * 1 . createDirectStream from kafak0.10 by SparkStreaming
+  * 2 . Filter Key by BaseDataChche.getItemByTypes()
+  * 3 . SaveAsHadoopSet to  MonitorDetails Table
+  * 4 . express monitor item by Key and rule
+  * 5 . SaveAsHadoopSet to  MonitorIndex Table
+  *
+  * -----------------------------------------------
+  *
+  * @author liubin
+  */
+object MonitorEventStreaming {
+  val checkpointDir = "/tmp/spark/checkpoint"
+  private final val logger = Logger.getLogger(MonitorEventStreaming.getClass)
+  private final val FAMILY_NAME = Array[Byte]('c'.toByte, 'f'.toByte)
+  private final val MONITOR_CQ_FIELDS = Array[Byte]('c'.toByte)
+  val FIELD_DELIMITER = String.valueOf(0.toChar)
+
+  def main(args: Array[String]): Unit = {
+
+    val kafkaParams = Map(
+      "bootstrap.servers" -> ConfigLoader.getInstance().getConfig.getProperties.get("bootstrap.servers"),
+      "key.deserializer" -> classOf[StringDeserializer],
+      "value.deserializer" -> classOf[StringDeserializer],
+      "group.id" -> ConfigLoader.getInstance().getConfig.getProperties.get("group.id"),
+      "auto.offset.reset" -> ConfigLoader.getInstance().getConfig.getProperties.get("auto.offset.reset"),
+      "session.timeout.ms" -> ConfigLoader.getInstance().getConfig.getProperties.get("session.timeout.ms"),
+      "request.timeout.ms" -> ConfigLoader.getInstance().getConfig.getProperties.get("request.timeout.ms"),
+      "heartbeat.interval.ms" -> ConfigLoader.getInstance().getConfig.getProperties.get("heartbeat.interval.ms"),
+      "spark.streaming.kafka.consumer.count.ms" -> ConfigLoader.getInstance().getConfig.getProperties.get("spark.streaming.kafka.consumer.count.ms"),
+      "spark.streaming.backpressure.enabled" -> (true: java.lang.Boolean),
+      "spark.streaming.backpressure.initialRate" -> ConfigLoader.getInstance().getConfig.getProperties.get("spark.streaming.backpressure.initialRate"),
+      "spark.streaming.kafka.maxRatePerPartition" -> ConfigLoader.getInstance().getConfig.getProperties.get("spark.streaming.kafka.maxRatePerPartition"),
+      "enable.auto.commit" -> (true: java.lang.Boolean)
+    )
+
+    val conf = new SparkConf().setAppName("MonitorStreaming")
+    val ssc = new StreamingContext(conf, Minutes(1))
+    val topics = Set(ConfigLoader.getInstance().getConfig.getProperties.get("topic.Name"))
+    BaseDataCache.init()
+    val dstream = KafkaUtils.createDirectStream[String, String](
+      ssc,
+      PreferConsistent,
+      Subscribe[String, String](topics, kafkaParams)
+    )
+
+    val streamRDD = dstream.map { r =>
+      logger.info(s"${r.partition()},,${r.offset()}-----------------${r.key()} ,,,,, ${r.value()}")
+      val map = BaseDataCache.getItemByTypes()
+      if (map.contains(r.key())) {
+        val v = map(r.key())
+        val jMap = ParseUtils.parseJson(r.value(), v)
+        if (jMap != null) {
+          val rowKey = jMap.get("host").toString + FIELD_DELIMITER + jMap.get("timestamp") + FIELD_DELIMITER + r.key() + FIELD_DELIMITER + jMap
+          Set((rowKey, r.value()))
+        } else {
+          Set.empty[(String, String)]
+        }
+      } else {
+        Set.empty[(String, String)]
+      }
+    }
+
+    streamRDD.foreachRDD((rdd: RDD[Set[(String, String)]], time: Time) => {
+      val hConf = rdd.sparkContext.hadoopConfiguration
+      setHBaseProperties(hConf)
+      hConf.set(TableOutputFormat.OUTPUT_TABLE, MonitorIndexDetail.TABLE_NAME.getNameAsString)
+      rdd.flatMap {
+        case r =>
+          r.map { m =>
+            val arr = m._1.split(FIELD_DELIMITER)
+            val rowKey = arr(0) + FIELD_DELIMITER + arr(1) + FIELD_DELIMITER + arr(2) //+ FIELD_DELIMITER + arr(3)
+            (NullWritable.get(), writeToHBase(rowKey, m._2))
+          }
+        case _ =>
+          Set.empty[(NullWritable, Put)]
+      }.saveAsNewAPIHadoopDataset(hConf)
+    })
+
+    streamRDD.foreachRDD((rdd: RDD[Set[(String, String)]], time: Time) => {
+      val hConf = rdd.sparkContext.hadoopConfiguration
+      setHBaseProperties(hConf)
+      hConf.set(TableOutputFormat.OUTPUT_TABLE, MonitorIndex.TABLE_NAME.getNameAsString)
+      rdd.flatMap {
+        case r =>
+          r.map { m =>
+            val arr = m._1.split(FIELD_DELIMITER)
+            val rowKey = arr(0) + FIELD_DELIMITER + arr(1) + FIELD_DELIMITER + arr(2)
+            val cf = expression(arr(2), m._2)
+            (NullWritable.get(), MonitorIndex.writeToHBase(rowKey, cf))
+          }
+        case _ =>
+          Set.empty[(NullWritable, Put)]
+      }.saveAsNewAPIHadoopDataset(hConf)
+    })
+
+    ssc.start()
+    ssc.awaitTermination()
+  }
+
+  import com.googlecode.aviator.AviatorEvaluator
+  import com.googlecode.aviator.Expression
+
+  def writeToHBase(rowKey: String, value: String): Put = {
+    val put = new Put(Bytes.toBytes(rowKey))
+    put.addColumn(FAMILY_NAME, MONITOR_CQ_FIELDS, Bytes.toBytes(value))
+    put
+  }
+
+  def expression(key: String, value: String): String = {
+    try {
+      val map = BaseDataCache.getItemByTypes()
+      map match {
+        case _ if map.contains(key) && BaseDataCache.getRuleBykey().contains(key) =>
+          (for (elem <- BaseDataCache.getRuleBykey()(key)) yield elem.concat(":") + {
+            exp(_ => {
+              val compile: Expression = AviatorEvaluator.compile(elem, false)
+              compile.execute(ParseUtils.parseJson(value, map(key)))
+            })
+          }).mkString(",")
+        case _ => ""
+      }
+    } catch {
+      case e => logger.error(s" express error : ${e} , by key : ${key} , value : ${value}")
+        ""
+    }
+  }
+
+  def exp(f: Unit => Object): Object = {
+    val func = f()
+    if (func.isInstanceOf[Double]) {
+      func.asInstanceOf[Double].formatted("%.4f")
+    } else {
+      func
+    }
+  }
+
+  def setHBaseProperties(hConf: Configuration) {
+    hConf.set(MRJobConfig.OUTPUT_FORMAT_CLASS_ATTR, ConfigLoader.getInstance().getConfig.getProperties.get("MRJobConfig.OUTPUT_FORMAT_CLASS_ATTR"))
+    hConf.set("hbase.cluster.distributed", ConfigLoader.getInstance().getConfig.getProperties.get("hbase.cluster.distributed"))
+    hConf.set("hbase.zookeeper.quorum", ConfigLoader.getInstance().getConfig.getProperties.get("hbase.zookeeper.quorum"))
+    hConf.set("hbase.zookeeper.useMulti", ConfigLoader.getInstance().getConfig.getProperties.get("hbase.zookeeper.useMulti"))
+    hConf.set("zookeeper.znode.parent", ConfigLoader.getInstance().getConfig.getProperties.get("zookeeper.znode.parent"))
+    hConf.set("zookeeper.session.timeout", ConfigLoader.getInstance().getConfig.getProperties.get("zookeeper.session.timeout"))
+  }
+
+  def createContext(): StreamingContext = {
+    println("Creating new Context")
+    val conf = new SparkConf()
+    val ssc = new StreamingContext(conf, Minutes(1))
+    ssc.checkpoint(checkpointDir)
+    ssc
+  }
+
+  object MonitorEventStreamingRunner extends App {
+    val workerNum = "4"
+    val classname = "cn.ce.bigdata.sparkstreaming.MonitorEventStreaming"
+    SparkApp(classname)
+      .addOptions(Master, "yarn-cluster")
+      .addOptions(Name, "MonitorEventStreaming")
+      .addOptions(ExecutorMemory, "6G")
+      .addOptions(NumExecutors, workerNum)
+      .addDependencyGroup(HBase)
+      .addDependencyGroup(StreamingKafka)
+      .run()
+  }
+}
