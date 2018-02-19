@@ -22,6 +22,4 @@
 > 2 . 如果有自定义的JAR包，可以通过addDependencyJars("file:///localDir/xx.jar") 
 > 3 . 如果要加入某个“配置”文件，可以通过addOptions(Files,"/localDir/fileName")
 
-![sss](https://mp.weixin.qq.com/misc/getqrcode?fakeid=3522253881&token=850887939&action=download&style=1&pixsize=336，https://mp.weixin.qq.com/cgi-bin/settingpage?t=setting/index&action=index&token=8508)
-
 
