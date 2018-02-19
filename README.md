@@ -14,6 +14,7 @@
           .run()
       }
 </code></pre>
- 
-  
-  只需extends app 邮件执行既可以将job提交到yarn-cluster 上面执行
+只需extends app 执行run既可以将job提交到yarn-cluster 上面执行
+> 具体的实现方式见：
+> SparkApp.scala 
+
