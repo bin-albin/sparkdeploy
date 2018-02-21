@@ -18,8 +18,8 @@
 > 具体的实现方式见： SparkApp
 
 ## 使用说明
-> 1 . 要将常使用到的jar包上传到HDFS或者其它的存储介质中
-  2 . 如果有自定义的JAR包，可以通过addDependencyJars("file:///localDir/xx.jar") 
-  3 . 如果要加入某个“配置”文件，可以通过addOptions(Files,"/localDir/fileName")
+> 1 . 要将常使用到的jar包上传到HDFS或者其它的存储介质中</br>
+  2 . 如果有自定义的JAR包，可以通过addDependencyJars("file:///localDir/xx.jar") </br>
+  3 . 如果要加入某个“配置”文件，可以通过addOptions(Files,"/localDir/fileName")</br>
 
 
